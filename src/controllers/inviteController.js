@@ -5,12 +5,102 @@ import bcrypt from "bcrypt";
 
 // Send Invite ----------------------------------------------------------------------------------------------------------
 
+// export async function sendInvite(req, res) {
+//   const { email } = req.body;
+//   const role = "Member";
+//   const sent_by = req.user.sub;
+
+//   if (!email) {
+//     return res.status(400).json({ message: "Email is required" });
+//   }
+
+//   try {
+//     // 1️⃣ Fetch seat limit of this admin
+//     const seatLimitRes = await pool.query(
+//       `SELECT seat_limit FROM users WHERE id = $1`,
+//       [sent_by]
+//     );
+//     const SEAT_LIMIT = seatLimitRes.rows[0]?.seat_limit || 19;
+
+//     // 2️⃣ Count current members (excluding owner)
+//     const usedRes = await pool.query(
+//       `
+//       SELECT COUNT(*) AS used
+//       FROM user_workspace
+//       WHERE workspace_id IN (
+//         SELECT id FROM workspaces WHERE owner_id = $1
+//       ) AND user_id != $1
+//       `,
+//       [sent_by]
+//     );
+//     const used = parseInt(usedRes.rows[0].used, 10);
+
+//     // 3️⃣ Count active pending invites
+//     const pendingRes = await pool.query(
+//       `
+//       SELECT COUNT(*) AS pending
+//       FROM invites
+//       WHERE sent_by = $1 AND used = FALSE AND expires_at > NOW()
+//       `,
+//       [sent_by]
+//     );
+//     const pending = parseInt(pendingRes.rows[0].pending, 10);
+
+//     const total = used + pending;
+//     if (total >= SEAT_LIMIT) {
+//       return res
+//         .status(403)
+//         .json({ message: `Seat limit reached (${SEAT_LIMIT} users)` });
+//     }
+
+//     // 4️⃣ Fetch one workspace ID to store (for tracking)
+//     const wsRes = await pool.query(
+//       `SELECT id FROM workspaces WHERE owner_id = $1 LIMIT 1`,
+//       [sent_by]
+//     );
+//     if (wsRes.rowCount === 0) {
+//       return res.status(400).json({ message: "No workspaces found for admin" });
+//     }
+
+//     const workspace_id = wsRes.rows[0].id;
+//     const token = uuidv4().replace(/-/g, "");
+//     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+
+//     // 5️⃣ Store invite
+//     await pool.query(
+//       `
+//       INSERT INTO invites (email, workspace_id, token, expires_at, role, sent_by)
+//       VALUES ($1, $2, $3, $4, $5, $6)
+//       `,
+//       [email, workspace_id, token, expiresAt, role, sent_by]
+//     );
+
+//     const link = `${process.env.BASE_URL}/accept-invite?token=${token}`;
+//     const subject = "You're Invited!";
+//     const htmlContent = `
+//       <p>You’ve been invited to join the workspace. Click the link below to set your password and join:</p>
+//       <a href="${link}">${link}</a>
+//       <p>This link expires in 24 hours.</p>
+//     `;
+//     await sendEmail(email, subject, htmlContent);
+//     console.log("✅ Email sent:", info);
+
+//     res.status(200).json({ message: "Invite sent successfully" });
+//   } catch (err) {
+//     console.error("Error sending invite:", err);
+//     res.status(500).json({ message: "Internal server error" });
+//   }
+// }
+
 export async function sendInvite(req, res) {
   const { email } = req.body;
   const role = "Member";
   const sent_by = req.user.sub;
 
+  console.log("📩 Incoming invite request:", { email, sent_by });
+
   if (!email) {
+    console.log("❌ No email provided");
     return res.status(400).json({ message: "Email is required" });
   }
 
@@ -21,6 +111,7 @@ export async function sendInvite(req, res) {
       [sent_by]
     );
     const SEAT_LIMIT = seatLimitRes.rows[0]?.seat_limit || 19;
+    console.log("👤 Seat limit for user:", SEAT_LIMIT);
 
     // 2️⃣ Count current members (excluding owner)
     const usedRes = await pool.query(
@@ -34,6 +125,7 @@ export async function sendInvite(req, res) {
       [sent_by]
     );
     const used = parseInt(usedRes.rows[0].used, 10);
+    console.log("👥 Current members in workspace:", used);
 
     // 3️⃣ Count active pending invites
     const pendingRes = await pool.query(
@@ -45,9 +137,15 @@ export async function sendInvite(req, res) {
       [sent_by]
     );
     const pending = parseInt(pendingRes.rows[0].pending, 10);
+    console.log("⏳ Active pending invites:", pending);
 
     const total = used + pending;
+    console.log(
+      `📊 Total used seats (${used}) + pending invites (${pending}) = ${total}`
+    );
+
     if (total >= SEAT_LIMIT) {
+      console.log("❌ Seat limit reached");
       return res
         .status(403)
         .json({ message: `Seat limit reached (${SEAT_LIMIT} users)` });
@@ -59,12 +157,16 @@ export async function sendInvite(req, res) {
       [sent_by]
     );
     if (wsRes.rowCount === 0) {
+      console.log("❌ No workspace found for this admin");
       return res.status(400).json({ message: "No workspaces found for admin" });
     }
 
     const workspace_id = wsRes.rows[0].id;
+    console.log("🗂 Workspace found:", workspace_id);
+
     const token = uuidv4().replace(/-/g, "");
     const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h
+    console.log("🔑 Invite token generated:", token);
 
     // 5️⃣ Store invite
     await pool.query(
@@ -74,6 +176,7 @@ export async function sendInvite(req, res) {
       `,
       [email, workspace_id, token, expiresAt, role, sent_by]
     );
+    console.log("💾 Invite stored in DB for:", email);
 
     const link = `${process.env.BASE_URL}/accept-invite?token=${token}`;
     const subject = "You're Invited!";
@@ -82,11 +185,14 @@ export async function sendInvite(req, res) {
       <a href="${link}">${link}</a>
       <p>This link expires in 24 hours.</p>
     `;
+
+    console.log("📨 About to send email via Brevo...");
     await sendEmail(email, subject, htmlContent);
+    console.log("✅ Email sent successfully to:", email);
 
     res.status(200).json({ message: "Invite sent successfully" });
   } catch (err) {
-    console.error("Error sending invite:", err);
+    console.error("🔥 Error in sendInvite controller:", err);
     res.status(500).json({ message: "Internal server error" });
   }
 }
@@ -218,9 +324,6 @@ export async function deleteInvite(req, res) {
     return res.status(500).json({ message: "Server error" });
   }
 }
-
-
-
 
 // import { v4 as uuidv4 } from "uuid";
 // import { sendEmail } from "../utils/email.js";
