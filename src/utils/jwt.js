@@ -5,13 +5,14 @@ dotenv.config();
 const secret = process.env.JWT_SECRET; // keep this strong & private
 const twentyFourHour = 60 * 60 * 24; // seconds
 
-export function signAccessToken({ sub, role, workspaceId }) {
+export function signAccessToken({ sub, email, role, workspaceId }) {
   const now = Math.floor(Date.now() / 1000);
 
   return jws.sign({
     header: { alg: "HS256", typ: "JWT" },
     payload: {
       sub, // subject = user id
+      email,
       role, // 'Owner'
       workspaceId,
       iat: now, // issued‑at

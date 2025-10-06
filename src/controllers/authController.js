@@ -4,12 +4,26 @@ import { comparePassword, hashPassword } from "../utils/hash.js";
 import { signAccessToken } from "../utils/jwt.js";
 import { v4 as uuidv4 } from "uuid";
 
+const MAX_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MINUTES = 30;
+const PASSWORD_REGEX =
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,}$/;
+
 // Create Admin ----------------------------------------------------------------------------------------------------
+
 export const createAdmin = async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password)
     return res.status(400).json({ message: "Email & password are required" });
+
+  // 🔒 SERVER-SIDE POLICY CHECK: Enforce strong password pattern
+  if (!PASSWORD_REGEX.test(password)) {
+    return res.status(400).json({
+      message:
+        "Password must be at least 8 characters long, including uppercase, lowercase, number, and symbol.",
+    });
+  }
 
   const client = await pool.connect();
 
@@ -29,8 +43,8 @@ export const createAdmin = async (req, res) => {
     // 2️⃣ Create user (Owner) with hashed password & seat limit
     const hashed = await hashPassword(password);
     const createUserQuery = `
-      INSERT INTO users (email, password_hash, role, seat_limit)
-      VALUES ($1, $2, 'Owner', 19)
+      INSERT INTO users (email, password_hash, role, seat_limit, failed_login_attempts, lockout_until)
+      VALUES ($1, $2, 'Owner', 19, 0, NULL) -- Ensure security fields are initialized
       RETURNING id
     `;
     const {
@@ -56,21 +70,21 @@ export const createAdmin = async (req, res) => {
     // extraction_credit upsert
     await client.query(
       `INSERT INTO extraction_credit (user_id, credit)
-     VALUES ($1, $2)
-     ON CONFLICT (user_id) DO UPDATE
-       SET credit = EXCLUDED.credit,
-           updated_at = now();`,
+      VALUES ($1, $2)
+      ON CONFLICT (user_id) DO UPDATE
+        SET credit = EXCLUDED.credit,
+            updated_at = now();`,
       [userId, 100000]
     );
 
     // research_credit upsert
     await client.query(
       `INSERT INTO research_credit (user_id, credit, last_renewed_at)
-     VALUES ($1, $2, now())
-     ON CONFLICT (user_id) DO UPDATE
-       SET credit = EXCLUDED.credit,
-           last_renewed_at = EXCLUDED.last_renewed_at,
-           updated_at = now();`,
+      VALUES ($1, $2, now())
+      ON CONFLICT (user_id) DO UPDATE
+        SET credit = EXCLUDED.credit,
+            last_renewed_at = EXCLUDED.last_renewed_at,
+            updated_at = now();`,
       [userId, 100000]
     );
 
@@ -79,6 +93,7 @@ export const createAdmin = async (req, res) => {
     // 5️⃣ Return JWT
     const token = signAccessToken({
       sub: userId,
+      email: email,
       role: "Owner",
       workspaceId,
     });
@@ -96,7 +111,6 @@ export const createAdmin = async (req, res) => {
   }
 };
 
-// Login -------------------------------------------------------------------------------------------------------------------
 export async function login(req, res) {
   const { email, password } = req.body;
 
@@ -107,53 +121,91 @@ export async function login(req, res) {
     const {
       rows: [user],
     } = await pool.query(
-      "SELECT id, email, password_hash, role FROM users WHERE email = $1",
+      // CRITICAL: Fetch the security columns for lockout check
+      `SELECT id, email, password_hash, role, failed_login_attempts, lockout_until 
+       FROM users 
+       WHERE email = $1`,
       [email]
     );
 
+    // 1. User not found (Return generic error)
     if (!user)
       return res.status(401).json({ message: "Invalid email or password" });
 
-    const valid = await comparePassword(password, user.password_hash);
-    if (!valid)
+    const now = new Date();
+
+    // 2. Check for account lockout BEFORE checking the password
+    if (user.lockout_until && user.lockout_until > now) {
+      // 🔒 SECURE: Return generic error to hide lockout status from attacker.
       return res.status(401).json({ message: "Invalid email or password" });
+    }
 
-    const {
-      rows: [workspace],
-    } = await pool.query(
-      `SELECT workspace_id
-     FROM user_workspace
-    WHERE user_id = $1
-    LIMIT 1`,
-      [user.id]
-    );
+    const valid = await comparePassword(password, user.password_hash);
 
-    const workspaceId = workspace?.workspace_id;
+    // 3. Handle successful login
+    if (valid) {
+      // Reset failed attempts and lockout time on success
+      if (user.failed_login_attempts > 0 || user.lockout_until) {
+        await pool.query(
+          "UPDATE users SET failed_login_attempts = 0, lockout_until = NULL WHERE id = $1",
+          [user.id]
+        );
+      }
 
-    // 🏷️ Include workspaceId in token
-    const token = signAccessToken({
-      sub: user.id,
-      role: user.role,
-      workspaceId, // 👈 added here
-    });
+      const {
+        rows: [workspace],
+      } = await pool.query(
+        `SELECT workspace_id
+        FROM user_workspace
+        WHERE user_id = $1
+        LIMIT 1`,
+        [user.id]
+      );
 
-    return res.status(200).json({
-      message: "Login successful",
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
+      const workspaceId = workspace?.workspace_id;
+
+      const token = signAccessToken({
+        sub: user.id,
+        email: email,
         role: user.role,
-        workspaceId, // optionally return here too
-      },
-    });
+        workspaceId,
+      });
+
+      return res.status(200).json({
+        message: "Login successful",
+        token,
+      });
+    }
+
+    // 4. Handle failed password attempt (Brute-Force Logic)
+    else {
+      const newAttempts = user.failed_login_attempts + 1;
+      let updateQuery =
+        "UPDATE users SET failed_login_attempts = $1 WHERE id = $2";
+      let updateValues = [newAttempts, user.id];
+
+      // Check if the threshold is met
+      if (newAttempts >= MAX_ATTEMPTS) {
+        // Lockout for 30 minutes
+        const lockoutUntil = new Date(
+          now.getTime() + LOCKOUT_DURATION_MINUTES * 60000
+        );
+
+        updateQuery =
+          "UPDATE users SET failed_login_attempts = $1, lockout_until = $3 WHERE id = $2";
+        updateValues = [newAttempts, user.id, lockoutUntil];
+      }
+
+      await pool.query(updateQuery, updateValues);
+
+      // 🔒 SECURE: Return generic error message
+      return res.status(401).json({ message: "Invalid email or password" });
+    }
   } catch (err) {
     console.error("Login error:", err);
     res.status(500).json({ message: "Internal Server Error" });
   }
 }
-
-// Request reset password -----------------------------------------------------------------------------------------------
 
 export async function requestPasswordReset(req, res) {
   const { email } = req.body;
@@ -226,12 +278,9 @@ export async function resetPassword(req, res) {
 
 // Get All users --------------------------------------------------------------------------------------------------------
 export async function getAllUsers(req, res) {
-  const role = req.user.role;
+  // 🔒 SECURE FIX: The check is now done via requireRole(['Owner']) middleware in the router.
+  // We can trust the request made it this far.
   const ownerId = req.user.sub;
-
-  if (role !== "Owner") {
-    return res.status(403).json({ message: "Access denied. Owners only." });
-  }
 
   try {
     const result = await pool.query(
@@ -255,6 +304,7 @@ export async function getAllUsers(req, res) {
     res.status(500).json({ message: "Server error" });
   }
 }
+
 export async function getUserDetailByEmail(req, res) {
   const { email } = req.query;
   try {
@@ -451,15 +501,25 @@ export async function updateUserProfile(req, res) {
 export async function deleteUser(req, res) {
   const userIdToDelete = req.params.userId;
   const requesterId = req.user.sub;
-  const requesterRole = req.user.role;
 
   try {
+    // 1. SECURE FIX: Get the requester's actual, verified role from the database.
+    const { rows } = await pool.query("SELECT role FROM users WHERE id = $1", [
+      requesterId,
+    ]);
+    if (rows.length === 0) {
+      return res.status(401).json({ message: "Requester not found." });
+    }
+    const requesterRole = rows[0].role;
+
+    // 2. Authorization check: Either self-delete OR verified Owner
     if (requesterId !== userIdToDelete && requesterRole !== "Owner") {
       return res
         .status(403)
         .json({ message: "Not authorized to delete this user." });
     }
 
+    // 3. The rest of the logic remains correct
     const {
       rows: [targetUser],
     } = await pool.query("SELECT role FROM users WHERE id = $1", [

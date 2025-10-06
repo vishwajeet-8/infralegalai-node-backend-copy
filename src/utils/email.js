@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import axios from "axios";
+import nodemailer from "nodemailer";
 dotenv.config();
 
 // export async function sendEmail(email, subject, htmlContent) {
