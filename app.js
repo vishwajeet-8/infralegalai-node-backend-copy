@@ -22,7 +22,7 @@ app.use(
       "https://law.infrahive.ai",
       "https://infrahive-ai-ui-temp.vercel.app",
       "https://demo-law-infrahive-ai.vercel.app",
-      "https://law-infrahive-copy.vercel.app/",
+      "https://law-infrahive-copy.vercel.app",
     ],
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
