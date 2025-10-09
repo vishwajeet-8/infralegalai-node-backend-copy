@@ -17,6 +17,7 @@ const app = express();
 // ✅ CORS must be first
 app.use(
   cors({
+    exposedHeaders: ['X-New-Token'],
     origin: [
       "http://localhost:5173",
       "https://law.infrahive.ai",
