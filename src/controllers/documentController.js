@@ -16,10 +16,95 @@ import path from "path";
 import { createRequire } from "module";
 const require = createRequire(import.meta.url);
 const { GoogleGenAI } = require("@google/genai");
+import sharp from "sharp"; // NEW: For image sanitization and EXIF stripping
+import mime from "mime-types"; // NEW: For MIME type validation
 
 const genAI = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY,
 });
+
+// Helper: Write buffer to temp file
+// async function writeTempFile(converted) {
+//   const tmpPath = path.join(os.tmpdir(), `${uuidv4()}_${converted.filename}`);
+//   await fs.writeFile(tmpPath, converted.data);
+//   return tmpPath;
+// }
+
+// export const uploadDocument = async (req, res) => {
+//   const files = req.files;
+//   const { workspaceId, folderId } = req.body;
+//   const uploadedBy = req.user.sub;
+
+//   if (!files || files.length === 0 || !workspaceId) {
+//     return res
+//       .status(400)
+//       .json({ message: "Files and workspaceId are required" });
+//   }
+
+//   try {
+//     for (const file of files) {
+//       const converted = await convertFileBuffer(file);
+//       const tmpPath = await writeTempFile(converted);
+
+//       const geminiFile = await genAI.files.upload({
+//         file: tmpPath,
+//         config: { mimeType: converted.mimeType },
+//       });
+
+//       let state = geminiFile.state.name;
+//       while (state === "PROCESSING") {
+//         await new Promise((r) => setTimeout(r, 1000));
+//         const updated = await genAI.files.get({ name: geminiFile.name });
+//         state = updated.state.name;
+//       }
+
+//       const convertedKey = `workspace_${workspaceId}/converted/${uuidv4()}_${
+//         converted.filename
+//       }`;
+//       const convertedCommand = new PutObjectCommand({
+//         Bucket: process.env.AWS_BUCKET_NAME,
+//         Key: convertedKey,
+//         Body: converted.data,
+//         ContentType: converted.mimeType,
+//       });
+//       await s3.send(convertedCommand);
+
+//       const originalKey = `workspace_${workspaceId}/original/${uuidv4()}_${
+//         file.originalname
+//       }`;
+//       const originalCommand = new PutObjectCommand({
+//         Bucket: process.env.AWS_BUCKET_NAME,
+//         Key: originalKey,
+//         Body: file.buffer,
+//         ContentType: file.mimetype,
+//       });
+//       await s3.send(originalCommand);
+
+//       await pool.query(
+//         `INSERT INTO documents (
+//           workspace_id, uploaded_by, filename, s3_key_converted, s3_key_original, gemini_uri, parent_folder_id, type
+//         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+//         [
+//           workspaceId,
+//           uploadedBy,
+//           file.originalname,
+//           convertedKey,
+//           originalKey,
+//           geminiFile.name,
+//           folderId || null,
+//           "file",
+//         ]
+//       );
+
+//       await fs.remove(tmpPath);
+//     }
+
+//     return res.status(200).json({ message: "Upload & Gemini sync successful" });
+//   } catch (err) {
+//     console.error("Upload Error:", err);
+//     return res.status(500).json({ message: "Upload failed" });
+//   }
+// };
 
 // Helper: Write buffer to temp file
 async function writeTempFile(converted) {
@@ -27,6 +112,20 @@ async function writeTempFile(converted) {
   await fs.writeFile(tmpPath, converted.data);
   return tmpPath;
 }
+
+// NEW: Whitelisted file types (extensions and MIME types). Customize as needed for legal docs.
+const allowedFileTypes = {
+  pdf: "application/pdf",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  txt: "text/plain",
+  md: "text/markdown",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  // Add more if needed. Excluded: exe, svg (risky for XSS), etc.
+};
 
 export const uploadDocument = async (req, res) => {
   const files = req.files;
@@ -41,7 +140,46 @@ export const uploadDocument = async (req, res) => {
 
   try {
     for (const file of files) {
-      const converted = await convertFileBuffer(file);
+      // NEW: Validate file type and size (e.g., max 10MB to prevent abuse)
+      const ext = path.extname(file.originalname).toLowerCase().slice(1); // Get extension without dot
+      const expectedMime = allowedFileTypes[ext];
+      if (
+        !expectedMime ||
+        file.mimetype !== expectedMime ||
+        file.size > 10 * 1024 * 1024
+      ) {
+        throw new Error(
+          `Invalid file type or size for ${file.originalname}. Allowed: PDF, DOCX, TXT, MD, JPG, PNG, GIF. Max 10MB.`
+        );
+      }
+
+      let originalBuffer = file.buffer; // Original file buffer
+      let originalMime = file.mimetype;
+      let originalFilename = file.originalname;
+
+      // NEW: Sanitize if image (strip EXIF) or SVG (rasterize to PNG, but since SVG excluded, optional)
+      const isImage = ["jpg", "jpeg", "png", "gif"].includes(ext);
+      if (isImage) {
+        // Use sharp to process image: strip metadata, recompress
+        const sanitizedImage = await sharp(originalBuffer)
+          .withMetadata({ exif: false, iptc: false, xmp: false, icc: false }) // Strip all metadata
+          .toBuffer(); // Output as buffer (keeps format)
+
+        originalBuffer = sanitizedImage; // Replace original buffer with sanitized
+        originalMime = mime.lookup(ext) || originalMime; // Ensure MIME is correct
+        originalFilename = originalFilename.replace(/\.[^/.]+$/, `.${ext}`); // Keep extension
+      }
+      // If you want to allow SVG in future:
+      // if (ext === 'svg') {
+      //   originalBuffer = await sharp(originalBuffer).png().toBuffer(); // Rasterize to PNG
+      //   originalMime = 'image/png';
+      //   originalFilename = originalFilename.replace('.svg', '.png');
+      // }
+
+      const converted = await convertFileBuffer({
+        ...file,
+        buffer: originalBuffer,
+      }); // Pass sanitized buffer to converter
       const tmpPath = await writeTempFile(converted);
 
       const geminiFile = await genAI.files.upload({
@@ -68,13 +206,13 @@ export const uploadDocument = async (req, res) => {
       await s3.send(convertedCommand);
 
       const originalKey = `workspace_${workspaceId}/original/${uuidv4()}_${
-        file.originalname
+        originalFilename // Use potentially updated filename
       }`;
       const originalCommand = new PutObjectCommand({
         Bucket: process.env.AWS_BUCKET_NAME,
         Key: originalKey,
-        Body: file.buffer,
-        ContentType: file.mimetype,
+        Body: originalBuffer, // Use sanitized buffer
+        ContentType: originalMime, // Use updated MIME if changed
       });
       await s3.send(originalCommand);
 
@@ -85,7 +223,7 @@ export const uploadDocument = async (req, res) => {
         [
           workspaceId,
           uploadedBy,
-          file.originalname,
+          originalFilename, // Store updated filename
           convertedKey,
           originalKey,
           geminiFile.name,
@@ -100,7 +238,9 @@ export const uploadDocument = async (req, res) => {
     return res.status(200).json({ message: "Upload & Gemini sync successful" });
   } catch (err) {
     console.error("Upload Error:", err);
-    return res.status(500).json({ message: "Upload failed" });
+    return res
+      .status(500)
+      .json({ message: "Upload failed", error: err.message });
   }
 };
 

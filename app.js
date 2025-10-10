@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
 
 import authRoutes from "./src/routes/authRoutes.js";
 import inviteRoutes from "./src/routes/inviteRoutes.js";
@@ -11,12 +12,14 @@ import creditRoutes from "./src/routes/creditRoutes.js";
 import roadmapRoutes from "./src/routes/roadmapRoutes.js";
 import tenatRoutes from "./src/routes/tenatRoutes.js";
 import autoDraftRoutes from "./src/routes/autoDraftRoutes.js";
+import { restrictHttpMethods } from "./src/middleware/methodFilter.js";
 
 const app = express();
 
 // ✅ CORS must be first
 app.use(
   cors({
+    exposedHeaders: ["X-New-Token"],
     origin: [
       "http://localhost:5173",
       "https://law.infrahive.ai",
@@ -27,6 +30,29 @@ app.use(
     credentials: true,
     methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+app.use(restrictHttpMethods);
+app.use(
+  helmet.contentSecurityPolicy({
+    directives: {
+      defaultSrc: ["'self'"], // Default to only allowing content from your own domain
+      scriptSrc: ["'self'", "'unsafe-inline'"], // Allow scripts from self; 'unsafe-inline' for React dev (remove in prod if possible)
+      styleSrc: ["'self'", "'unsafe-inline'"], // Similar for styles
+      imgSrc: ["'self'", "data:"], // Allow images from self and data URIs
+      connectSrc: ["'self'"], // For API calls
+      fontSrc: ["'self'"], // If using custom fonts
+      objectSrc: ["'none'"], // Block plugins
+      upgradeInsecureRequests: [], // Force HTTPS for resources
+    },
+  })
+);
+app.use(
+  helmet.hsts({
+    maxAge: 31536000, // 1 year in seconds (recommended minimum)
+    includeSubDomains: true, // Apply to subdomains
+    preload: true, // Allow submission to browser preload lists (optional, but good for production)
   })
 );
 
